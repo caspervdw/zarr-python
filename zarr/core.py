@@ -5,6 +5,7 @@ import math
 import operator
 import re
 from functools import reduce
+from asgiref.sync import sync_to_async
 
 import numpy as np
 from numcodecs.compat import ensure_bytes, ensure_ndarray
@@ -2642,3 +2643,129 @@ class Array:
         filters.insert(0, AsType(encode_dtype=self._dtype, decode_dtype=dtype))
 
         return self.view(filters=filters, dtype=dtype, read_only=True)
+
+    ## BELOW ASYNC COPIES OF EXISTING FUNCTIONS
+    
+    async def get_async(self, selection):
+        # async version of __getitem__
+        fields, pure_selection = pop_fields(selection)
+        if is_pure_fancy_indexing(pure_selection, self.ndim):
+            raise NotImplementedError()
+            result = self.vindex[selection]
+        else:
+            result = await self.get_basic_selection_aio(pure_selection, fields=fields)
+        return result
+
+
+    async def get_basic_selection_aio(self, selection=Ellipsis, out=None, fields=None):
+        # refresh metadata
+        if not self._cache_metadata:
+            self._load_metadata()
+
+        # check args
+        check_fields(fields, self._dtype)
+
+        # handle zero-dimensional arrays
+        if self._shape == ():
+            raise NotImplementedError()
+        else:
+            return await self._get_basic_selection_nd_aio(selection=selection, out=out,
+                                                fields=fields)
+
+
+    async def _get_basic_selection_nd_aio(self, selection, out=None, fields=None):
+        # implementation of basic selection for array with at least one dimension
+
+        # setup indexer
+        indexer = BasicIndexer(selection, self)
+
+        return await self._get_selection_aio(indexer=indexer, out=out, fields=fields)
+
+    async def _get_selection_aio(self, indexer, out=None, fields=None):
+        # See _get_selection
+
+        out_dtype = check_fields(fields, self._dtype)
+
+        # determine output shape
+        out_shape = indexer.shape
+
+        # setup output array
+        if out is None:
+            out = np.empty(out_shape, dtype=out_dtype, order=self._order)
+        else:
+            check_array_shape('out', out, out_shape)
+
+        # gather chunks (for asyncio _chunk_getitems makes no sense)
+        if True:  # not hasattr(self.chunk_store, "getitems") or \
+           #    any(map(lambda x: x == 0, self.shape)):
+            awaitables = []
+            for chunk_coords, chunk_selection, out_selection in indexer:
+                awaitables.append(
+                    self._chunk_getitem_aio(chunk_coords, chunk_selection, out, out_selection,
+                                    drop_axes=indexer.drop_axes, fields=fields)
+                            )
+            import asyncio
+            await asyncio.gather(*awaitables)
+
+                # load chunk selection into output array
+                
+        else:
+            raise NotImplementedError()
+            # allow storage to get multiple items at once
+            lchunk_coords, lchunk_selection, lout_selection = zip(*indexer)
+            self._chunk_getitems(lchunk_coords, lchunk_selection, out, lout_selection,
+                                 drop_axes=indexer.drop_axes, fields=fields)
+
+        if out.shape:
+            return out
+        else:
+            return out[()]
+
+    async def _chunk_getitem_aio(self, chunk_coords, chunk_selection, out, out_selection,
+                       drop_axes=None, fields=None):
+        """Obtain part or whole of a chunk.
+
+        Parameters
+        ----------
+        chunk_coords : tuple of ints
+            Indices of the chunk.
+        chunk_selection : selection
+            Location of region within the chunk to extract.
+        out : ndarray
+            Array to store result in.
+        out_selection : selection
+            Location of region within output array to store results in.
+        drop_axes : tuple of ints
+            Axes to squeeze out of the chunk.
+        fields
+            TODO
+
+        """
+        out_is_ndarray = True
+        try:
+            out = ensure_ndarray(out)
+        except TypeError:
+            out_is_ndarray = False
+
+        assert len(chunk_coords) == len(self._cdata_shape)
+
+        # obtain key for chunk
+        ckey = self._chunk_key(chunk_coords)
+
+        try:
+            # Await IO-bound call
+            cdata = await self.chunk_store.get_async(ckey)
+
+        except KeyError:
+            # chunk not initialized
+            if self._fill_value is not None:
+                if fields:
+                    fill_value = self._fill_value[fields]
+                else:
+                    fill_value = self._fill_value
+                out[out_selection] = fill_value
+
+        else:
+            # Put CPU-bound call in a thread
+            await sync_to_async(self._process_chunk)(out, cdata, chunk_selection, drop_axes,
+                                out_is_ndarray, fields, out_selection)

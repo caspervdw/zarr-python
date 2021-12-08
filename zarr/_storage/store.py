@@ -3,6 +3,7 @@ from typing import Any, List, Optional, Union
 
 from zarr.meta import Metadata2
 from zarr.util import normalize_storage_path
+from asgiref.sync import sync_to_async
 
 # v2 store keys
 array_meta_key = '.zarray'
@@ -58,6 +59,11 @@ class BaseStore(MutableMapping):
         self._open_count -= 1
         if self._open_count == 0:
             self.close()
+
+    @sync_to_async
+    def get_async(self, index):
+        # Subclasses may implement a native asyncio version
+        return self[index]
 
     def close(self) -> None:
         """Do nothing by default"""
